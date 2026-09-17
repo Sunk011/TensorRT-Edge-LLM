@@ -522,6 +522,52 @@ def fp8_quantize(
 def _(hidden_states, scale):
     return torch.empty_like(hidden_states)
 
+# ---------------------------------------------------------------------------
+# 新增: fp8_block_dequantize
+# ---------------------------------------------------------------------------
+def _fp8_block_dequantize_eager(
+    weight_blocks: torch.Tensor,
+    scale_inv: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize flattened 2-D FP8 blocks.
+
+    weight_blocks: [num_blocks, block_n * block_k]
+    scale_inv:     [num_blocks]
+    """
+
+    weight_fp32 = weight_blocks.to(torch.float32)
+
+    scale_fp32 = scale_inv.to(
+        torch.float32
+    ).reshape(-1, 1)
+
+    return (
+        weight_fp32 * scale_fp32
+    ).to(torch.float16)
+
+
+@torch.library.custom_op(
+    "trt::fp8_block_dequantize",
+    mutates_args=(),
+)
+def fp8_block_dequantize(
+    weight_blocks: torch.Tensor,
+    scale_inv: torch.Tensor,
+) -> torch.Tensor:
+    return _fp8_block_dequantize_eager(
+        weight_blocks,
+        scale_inv,
+    )
+
+
+@fp8_block_dequantize.register_fake
+def _(weight_blocks, scale_inv):
+    return torch.empty_like(
+        weight_blocks,
+        dtype=torch.float16,
+    )
+
+
 
 # ---------------------------------------------------------------------------
 # Custom op: trt::fp8_dequantize

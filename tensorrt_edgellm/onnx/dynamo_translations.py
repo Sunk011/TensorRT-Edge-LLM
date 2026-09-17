@@ -157,6 +157,34 @@ def _fp8_dequantize_translation(
 
 
 # ---------------------------------------------------------------------------
+# FP8 block ops
+# ---------------------------------------------------------------------------
+@script()
+def _fp8_block_dequantize_translation(
+    x: onnxscript.FLOAT8E4M3FN,
+    scale: onnxscript.FLOAT,
+) -> onnxscript.FLOAT16:
+
+    # x:
+    # [num_blocks, block_n * block_k]
+    #
+    # scale:
+    # [num_blocks]
+    #
+    # 每一行使用一个 scale
+    dq = _op21.DequantizeLinear(
+        x,
+        scale,
+        axis=0,
+    )
+
+    return _op21.Cast(
+        dq,
+        to=int(onnx.TensorProto.FLOAT16),
+    )
+
+
+# ---------------------------------------------------------------------------
 # NVFP4 ops
 # ---------------------------------------------------------------------------
 
@@ -1344,6 +1372,8 @@ def build_custom_translation_table() -> dict:
         _fp8_quantize_translation,
         torch.ops.trt.fp8_dequantize.default:
         _fp8_dequantize_translation,
+        torch.ops.trt.fp8_block_dequantize.default:
+        _fp8_block_dequantize_translation,
         torch.ops.trt.nvfp4_act_qdq.default:
         _nvfp4_act_qdq_translation,
         torch.ops.trt.nvfp4_dequantize.default:

@@ -67,6 +67,10 @@ from .checkpoint.checkpoint_utils import load_checkpoint_config_dicts
 
 QUANT_FP16 = "fp16"
 QUANT_FP8 = "fp8"
+
+# 新增
+QUANT_FP8_BLOCK = "fp8_block"
+
 QUANT_MXFP8 = "mxfp8"
 QUANT_NVFP4 = "nvfp4"
 # Weight-only NVFP4 (W4A16): ModelOpt ``W4A16_NVFP4`` — 4-bit float weights,
@@ -400,6 +404,11 @@ class QuantConfig:
     quant_type: str = QUANT_FP16
     # group_size: 1 = per-tensor/per-channel, 16 for NVFP4, 128 for AWQ
     group_size: int = 1
+
+    # 新增：二维 block quantization
+    block_size: Tuple[int, int] = (1, 1)
+
+
     # GPTQ checkpoints are not consistent about whether qzeros stores the
     # actual zero point or (zero point - 1).  The loader uses:
     # actual_zero = stored_zero + gptq_zero_point_offset.
@@ -2154,8 +2163,17 @@ def _detect_quantized_modules(model_dir: str) -> List[str]:
     """Return modules that have checkpoint quantization sidecars."""
     all_keys = _checkpoint_weight_keys(model_dir)
 
-    suffixes = (".qweight", ".weight_scale", ".weight_scale_2", ".input_scale",
-                ".scales")
+    # suffixes = (".qweight", ".weight_scale", ".weight_scale_2", ".input_scale",
+    #             ".scales")
+
+    suffixes = (
+        ".qweight",
+        ".weight_scale",
+        ".weight_scale_inv",   # 新增
+        ".weight_scale_2",
+        ".input_scale",
+        ".scales",
+    )
     modules = {
         _strip_vl_prefix(k.rsplit(".", 1)[0])
         for k in all_keys if k.endswith(suffixes)
@@ -2227,9 +2245,15 @@ def _detect_modelopt_unquantized_linears(model_dir: str,
         k.rsplit(".", 1)[0]
         for k in all_keys if k.endswith(".weight")
     }
+    # scale_modules = {
+    #     k.rsplit(".", 1)[0]
+    #     for k in all_keys if k.endswith(".weight_scale")
+    # }
+
     scale_modules = {
         k.rsplit(".", 1)[0]
-        for k in all_keys if k.endswith(".weight_scale")
+        for k in all_keys
+        if k.endswith((".weight_scale", ".weight_scale_inv")) # 增加
     }
     unquantized = weight_modules - scale_modules
 
@@ -2382,6 +2406,58 @@ def _parse_quant(model_dir: str,
                 _scope_exclusions(list(qc.get("ignore", [])),
                                   submodel_prefix)),
         )
+
+    
+    # 新增: quant_method == fp8 with 2-D block scales
+    if qc.get("quant_method") == "fp8":
+        weight_block_size = qc.get("weight_block_size")
+
+        if weight_block_size is not None:
+            if len(weight_block_size) != 2:
+                raise ValueError(
+                    "FP8 weight_block_size must contain exactly 2 dimensions, "
+                    f"got {weight_block_size}"
+                )
+
+            block_n = int(weight_block_size[0])
+            block_k = int(weight_block_size[1])
+
+            if block_n <= 0 or block_k <= 0:
+                raise ValueError(
+                    f"Invalid FP8 block size: {weight_block_size}"
+                )
+
+            excluded_raw = list(
+                qc.get("modules_to_not_convert", [])
+            )
+
+            excluded_raw.extend(
+                qc.get("ignored_layers", [])
+            )
+
+            excluded = _effective_excluded_modules(
+                model_dir,
+                _scope_exclusions(
+                    excluded_raw,
+                    submodel_prefix,
+                ),
+            )
+
+            excluded.extend(
+                module
+                for module in _detect_modelopt_unquantized_linears(
+                    model_dir,
+                    submodel_prefix,
+                )
+                if module not in excluded
+            )
+
+            return QuantConfig(
+                quant_type=QUANT_FP8_BLOCK,
+                group_size=block_k,
+                block_size=(block_n, block_k),
+                excluded=excluded,
+            )
 
     # quant_method == awq (column-packed int4 checkpoints)
     if qc.get("quant_method") == "awq":

@@ -49,7 +49,8 @@ import torch.nn.functional as F
 
 from ...config import ModelConfig
 from ..linear import (FP16Linear, NVFP4LinearMethod, ReplicatedLinear, TPMode,
-                      is_int4_linear, is_nvfp4_linear, make_linear)
+                      is_int4_linear, is_nvfp4_linear, make_linear,
+                      FP8BlockLinear,)
 from ..ops import KV_PAGE_SIZE, attention_plugin, qkv_concat
 
 logger = logging.getLogger(__name__)
@@ -444,6 +445,19 @@ def fuse_qkv_projections(model: nn.Module) -> int:
 
         proj_modules = [getattr(attn, n) for n in _QKV_PROJ_NAMES]
         first_proj = attn.q_proj
+
+        # First bring-up: keep block-FP8 Q/K/V separate.
+        #
+        # The existing fused-QKV path creates FP16Linear for every
+        # non-NVFP4 projection, which would reintroduce
+        # FP8-weight -> FP16Linear.
+        if isinstance(first_proj, FP8BlockLinear):
+            logger.debug(
+                "QKV fusion skipped for %s: FP8BlockLinear bring-up path.",
+                name,
+            )
+            continue
+
         # Mixed quantization across Q/K/V cannot be fused into one GEMM.
         if any(type(p) is not type(first_proj) for p in proj_modules):
             logger.warning(
@@ -508,6 +522,13 @@ def fuse_qkv_projections(model: nn.Module) -> int:
                                             dtype=torch.float16,
                                             mapping=first_proj.mapping,
                                             quant_method=method)
+        elif isinstance(first_proj, FP8BlockLinear):
+            fused_linear = FP8BlockLinear(
+                in_features=in_features,
+                out_features=fused_out_dim,
+                block_size=first_proj.block_size,
+                bias=has_bias,
+            )
         else:
             fused_linear = FP16Linear(in_features,
                                       fused_out_dim,
