@@ -418,7 +418,8 @@ def fuse_qkv_projections(model: nn.Module) -> int:
     A single fused GEMM feeds the packed-QKV plugin input directly (no Concat,
     no reliance on the compiler backend's horizontal GEMM fusion).
 
-    Per quant type: FP16 always fuses; NVFP4 fuses only when the per-tensor
+    Per quant type: FP16 always fuses; FP8BlockLinear fuses when Q/K/V use the
+    same 2-D block layout; NVFP4 fuses only when the per-tensor
     scales (``input_scale``, ``weight_scale_2``) match across Q/K/V (mismatch
     => warn and fall back to 3 GEMMs + concat); other quant types skip.
     FP8-KV-cache layers also skip — ``k_scale`` / ``v_scale`` live on
@@ -451,12 +452,12 @@ def fuse_qkv_projections(model: nn.Module) -> int:
         # The existing fused-QKV path creates FP16Linear for every
         # non-NVFP4 projection, which would reintroduce
         # FP8-weight -> FP16Linear.
-        if isinstance(first_proj, FP8BlockLinear):
-            logger.debug(
-                "QKV fusion skipped for %s: FP8BlockLinear bring-up path.",
-                name,
-            )
-            continue
+        # if isinstance(first_proj, FP8BlockLinear):
+        #     logger.debug(
+        #         "QKV fusion skipped for %s: FP8BlockLinear bring-up path.",
+        #         name,
+        #     )
+        #     continue
 
         # Mixed quantization across Q/K/V cannot be fused into one GEMM.
         if any(type(p) is not type(first_proj) for p in proj_modules):
@@ -466,6 +467,21 @@ def fuse_qkv_projections(model: nn.Module) -> int:
             continue
         if isinstance(first_proj, FP16Linear):
             pass  # always fusible
+        elif isinstance(first_proj, FP8BlockLinear):
+            # Q/K/V must use exactly the same 2-D block layout.
+            block_sizes = [
+                proj.block_size
+                for proj in proj_modules
+            ]
+
+            if any(
+                block_size != first_proj.block_size
+                for block_size in block_sizes
+            ):
+                raise RuntimeError(
+                    f"QKV fusion: FP8 block sizes differ for {name}: "
+                    f"{block_sizes}"
+                )
         elif is_nvfp4_linear(first_proj):
             if not _can_fuse_nvfp4_scales(attn):
                 logger.warning(
