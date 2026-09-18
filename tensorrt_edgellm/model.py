@@ -643,33 +643,16 @@ class AutoModel:
             from .models.qwen3_5 import fuse_gdn_input_projections
             fuse_gdn_input_projections(model)
 
-        # # Fuse attention Q/K/V projections into one packed-QKV GEMM where eligible.
-        # from .models.default.modeling_default import fuse_qkv_projections
-        # fuse_qkv_projections(model)
-
-        # return model
-
         # Fuse attention Q/K/V projections into one packed-QKV GEMM where eligible.
         from .models.default.modeling_default import fuse_qkv_projections
         fuse_qkv_projections(model)
 
-        # ------------------------------------------------------------
-        # Offline repack Qwen-style 2-D block FP8 weights.
-        #
-        # This MUST happen after QKV fusion:
-        #
-        # q/k/v original [N,K] weights + [Nb,Kb] scales
-        #         ↓
-        # optional QKV fusion
-        #         ↓
-        # final Linear weights
-        #         ↓
-        # block-major repack
-        #
-        # The exported FP8 initializer can then feed DequantizeLinear directly.
-        # ------------------------------------------------------------
-        from .models.linear import repack_fp8_block_weights
-        repack_fp8_block_weights(model)
+        # Bit-view Qwen-style 2-D block FP8 weights (fp8 -> int8) for export.
+        # Must run AFTER QKV fusion so concatenated q/k/v weights are viewed
+        # once; the FP8BlockGemmPlugin consumes the int8 weight bytes plus the
+        # fp32 [N/128, K/128] weight_scale_inv unchanged.
+        from .models.linear import prepare_fp8_block_weights
+        prepare_fp8_block_weights(model)
 
         return model
 

@@ -522,51 +522,80 @@ def fp8_quantize(
 def _(hidden_states, scale):
     return torch.empty_like(hidden_states)
 
-# ---------------------------------------------------------------------------
-# 新增: fp8_block_dequantize
-# ---------------------------------------------------------------------------
-def _fp8_block_dequantize_eager(
-    weight_blocks: torch.Tensor,
-    scale_inv: torch.Tensor,
-) -> torch.Tensor:
-    """Dequantize flattened 2-D FP8 blocks.
 
-    weight_blocks: [num_blocks, block_n * block_k]
-    scale_inv:     [num_blocks]
+# ---------------------------------------------------------------------------
+# Custom op: trt::fp8_block_gemm
+# ---------------------------------------------------------------------------
+# Block-wise FP8 GEMM group size (activation per-token groups and weight
+# blocks are both 128 along K for the Qwen3 / DeepSeek recipe).
+_FP8_BLOCK_GEMM_GROUP = 128
+
+
+def _fp8_block_gemm_eager(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    gemm_n: int,
+    gemm_k: int,
+) -> torch.Tensor:
+    """Numeric reference for the block-wise FP8 GEMM plugin.
+
+    Mirrors the plugin: dynamically fake-quantize the activation per-token,
+    per-128-K-group onto the E4M3 grid, dequantize the weight per 128x128
+    block, then fp32 matmul -> fp16.
+
+    hidden_states:    [..., K] float16
+    weight:           [N, K] int8 (fp8-e4m3 bit view) or float8_e4m3fn
+    weight_scale_inv: [N/128, K/128] float32
     """
+    g = _FP8_BLOCK_GEMM_GROUP
+    lead = hidden_states.shape[:-1]
+    x = hidden_states.to(torch.float32).reshape(-1, gemm_k)
+    m = x.shape[0]
 
-    weight_fp32 = weight_blocks.to(torch.float32)
+    # Activation: per-token, per-128-group dynamic quantize -> dequantize.
+    xg = x.reshape(m, gemm_k // g, g)
+    amax = xg.abs().amax(dim=-1, keepdim=True)
+    act_scale = amax / _FP8_E4M3_MAX
+    qmul = torch.where(amax > 0, _FP8_E4M3_MAX / amax.clamp(min=1e-12),
+                       torch.zeros_like(amax))
+    xq = (xg * qmul).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(
+        torch.float8_e4m3fn).to(torch.float32)
+    xdq = (xq * act_scale).reshape(m, gemm_k)
 
-    scale_fp32 = scale_inv.to(
-        torch.float32
-    ).reshape(-1, 1)
+    # Weight: reinterpret fp8 bits, dequantize per 128x128 block.
+    w = weight.view(torch.float8_e4m3fn).to(torch.float32).reshape(
+        gemm_n // g, g, gemm_k // g, g)
+    s = weight_scale_inv.to(torch.float32).reshape(gemm_n // g, 1, gemm_k // g,
+                                                   1)
+    wdq = (w * s).reshape(gemm_n, gemm_k)
 
-    return (
-        weight_fp32 * scale_fp32
-    ).to(torch.float16)
+    out = xdq @ wdq.t()
+    return out.reshape(*lead, gemm_n).to(torch.float16)
 
 
-@torch.library.custom_op(
-    "trt::fp8_block_dequantize",
-    mutates_args=(),
-)
-def fp8_block_dequantize(
-    weight_blocks: torch.Tensor,
-    scale_inv: torch.Tensor,
+@torch.library.custom_op("trt::fp8_block_gemm", mutates_args=())
+def fp8_block_gemm(
+    hidden_states: torch.Tensor,  # float16 [..., K]
+    weight: torch.Tensor,  # int8 [N, K] (fp8-e4m3 bits)
+    weight_scale_inv: torch.Tensor,  # float32 [N/128, K/128]
+    gemm_n: int,
+    gemm_k: int,
 ) -> torch.Tensor:
-    return _fp8_block_dequantize_eager(
-        weight_blocks,
-        scale_inv,
-    )
+    """Block-wise FP8 GEMM; ONNX export -> trt_edgellm::FP8BlockGemmPlugin.
+
+    Eager body is the numeric reference (see _fp8_block_gemm_eager); export uses
+    register_fake and emits the plugin node, so the body does not affect it.
+    """
+    return _fp8_block_gemm_eager(hidden_states, weight, weight_scale_inv,
+                                 gemm_n, gemm_k)
 
 
-@fp8_block_dequantize.register_fake
-def _(weight_blocks, scale_inv):
-    return torch.empty_like(
-        weight_blocks,
-        dtype=torch.float16,
-    )
-
+@fp8_block_gemm.register_fake
+def _(hidden_states, weight, weight_scale_inv, gemm_n, gemm_k):
+    return torch.empty((*hidden_states.shape[:-1], gemm_n),
+                       dtype=torch.float16,
+                       device=hidden_states.device)
 
 
 # ---------------------------------------------------------------------------

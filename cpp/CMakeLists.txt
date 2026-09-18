@@ -22,6 +22,12 @@ set(CMAKE_CUDA_FLAGS_RELEASE
 
 set(CMAKE_CUDA_FLAGS_DEBUG "-g")
 
+# CUTLASS source root for the FP8 block-wise GEMM kernel (SM100 blockwise
+# collective). Vendored as a submodule under 3rdParty/cutlass.
+set(CUTLASS_DIR
+    "${CMAKE_SOURCE_DIR}/3rdParty/cutlass"
+    CACHE PATH "CUTLASS source root (headers) for the FP8 blockwise GEMM")
+
 # Hide internal C++ symbols; only EDGELLM_PLUGIN_EXPORT entry points stay
 # visible. Prevents duplicate-symbol collisions when our libraries are loaded
 # together.
@@ -153,6 +159,12 @@ list(
   REGEX
   "marlin_moe_wna16/(ops|sm80_kernel_(float16_u4_float16|float16_fe2m1_float16|bfloat16_fe2m1_bfloat16))\\.cu$"
 )
+# The FP8 blockwise CUTLASS GEMM TU is compiled in a dedicated target
+# (edgellmFp8BlockwiseGemm) restricted to Blackwell datacenter archs; keep it
+# out of the generic multi-arch kernel glob. The plain-CUDA per-token group
+# quantize kernel stays in the glob.
+list(FILTER KERNELS_CU_SRCS EXCLUDE REGEX
+     "fp8BlockwiseGemm/fp8BlockwiseGemmRunner\\.cu$")
 # JIT compilation and module loading belong to the plugin, not the core kernel
 # archives. Unit tests link this target explicitly for direct compiler coverage.
 set(PLUGIN_JIT_CPP_SRCS
@@ -199,6 +211,62 @@ edgellm_apply_qnx_warning_suppressions(edgellmKernels)
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 edgellm_set_hidden_visibility(edgellmKernels)
+
+# ------------------------------------------------------------------------------
+# FP8 block-wise GEMM (CUTLASS SM100 blockwise collective). Heavy CUTLASS TU
+# compiled only for Blackwell datacenter archs (tcgen05: SM100/101/103/110). On
+# other archs (or when CUTLASS is absent) it builds an inert stub so the plugin
+# still links and reports "unsupported" at runtime.
+# ------------------------------------------------------------------------------
+set(_fp8bw_archs "")
+foreach(_arch ${CMAKE_CUDA_ARCHITECTURES})
+  string(REGEX REPLACE "[^0-9].*$" "" _arch_num "${_arch}")
+  if(_arch_num STREQUAL "100"
+     OR _arch_num STREQUAL "101"
+     OR _arch_num STREQUAL "103"
+     OR _arch_num STREQUAL "110")
+    list(APPEND _fp8bw_archs "${_arch}")
+  endif()
+endforeach()
+list(REMOVE_DUPLICATES _fp8bw_archs)
+
+add_library(
+  edgellmFp8BlockwiseGemm STATIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fp8BlockwiseGemm/fp8BlockwiseGemmRunner.cu"
+)
+target_include_directories(edgellmFp8BlockwiseGemm
+                           PRIVATE ${COMMON_INCLUDE_DIRS})
+set_target_properties(edgellmFp8BlockwiseGemm
+                      PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+if(_fp8bw_archs)
+  set_target_properties(edgellmFp8BlockwiseGemm PROPERTIES CUDA_ARCHITECTURES
+                                                           "${_fp8bw_archs}")
+  if(EXISTS "${CUTLASS_DIR}/include/cutlass/cutlass.h")
+    target_compile_definitions(edgellmFp8BlockwiseGemm
+                               PRIVATE EDGELLM_FP8_BLOCKWISE_GEMM_ENABLED)
+    target_include_directories(
+      edgellmFp8BlockwiseGemm PRIVATE "${CUTLASS_DIR}/include"
+                                      "${CUTLASS_DIR}/tools/util/include")
+    message(
+      STATUS
+        "FP8 blockwise GEMM: enabled (CUTLASS=${CUTLASS_DIR}, archs=${_fp8bw_archs})"
+    )
+  else()
+    message(
+      WARNING
+        "FP8 blockwise GEMM: CUTLASS not found at ${CUTLASS_DIR}; building stub"
+    )
+  endif()
+else()
+  message(
+    STATUS
+      "FP8 blockwise GEMM: no Blackwell datacenter arch in CMAKE_CUDA_ARCHITECTURES; building stub"
+  )
+endif()
+target_link_libraries(edgellmFp8BlockwiseGemm PRIVATE ${CUDA_DRIVER_LINK_LIB}
+                                                      ${CUDART_LIB})
+edgellm_apply_qnx_warning_suppressions(edgellmFp8BlockwiseGemm)
+edgellm_set_hidden_visibility(edgellmFp8BlockwiseGemm)
 
 file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")
 
@@ -248,8 +316,8 @@ target_include_directories(NvInfer_edgellm_plugin
                            PRIVATE ${COMMON_INCLUDE_DIRS})
 target_link_libraries(
   NvInfer_edgellm_plugin
-  PRIVATE commonLibraryExt edgellmKernels edgellmPluginJit
-          ${CUDA_DRIVER_LINK_LIB} ${CUDART_LIB})
+  PRIVATE commonLibraryExt edgellmKernels edgellmFp8BlockwiseGemm
+          edgellmPluginJit ${CUDA_DRIVER_LINK_LIB} ${CUDART_LIB})
 add_cross_build_link_options(NvInfer_edgellm_plugin)
 edgellm_apply_qnx_warning_suppressions(NvInfer_edgellm_plugin)
 edgellm_set_hidden_visibility(NvInfer_edgellm_plugin)

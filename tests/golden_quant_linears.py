@@ -109,6 +109,46 @@ class _GoldenFP8Linear(torch.nn.Module):
         return torch.nn.functional.linear(x_dq, w_dq, self.bias)
 
 
+class _GoldenFP8BlockLinear(torch.nn.Module):
+    """Standalone block-wise FP8 fake-quant linear (mirrors FP8BlockLinear).
+
+    Weight is FP8 E4M3 ``[N, K]`` with per-128x128-block fp32 scales
+    ``weight_scale_inv [N/128, K/128]``; the activation is dynamically
+    quantized per-token, per-128-K group. Reuses the same ``trt::fp8_block_gemm``
+    op the export emits.
+    """
+
+    def __init__(self,
+                 in_features: int,
+                 out_features: int,
+                 has_bias: bool,
+                 block_size: int = 128) -> None:
+        super().__init__()
+        self.block_size = block_size
+        self.register_buffer(
+            "weight",
+            torch.empty(out_features, in_features, dtype=torch.float8_e4m3fn))
+        self.register_buffer(
+            "weight_scale_inv",
+            torch.ones(out_features // block_size,
+                       in_features // block_size,
+                       dtype=torch.float32))
+        if has_bias:
+            self.register_buffer(
+                "bias", torch.empty(out_features, dtype=torch.float16))
+        else:
+            self.bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from tensorrt_edgellm.models.ops import fp8_block_gemm
+        n, k = self.weight.shape
+        out = fp8_block_gemm(x.to(torch.float16), self.weight.view(torch.int8),
+                             self.weight_scale_inv, n, k)
+        if self.bias is not None:
+            out = out + self.bias.to(torch.float16)
+        return out
+
+
 class _GoldenMXFP8Linear(torch.nn.Module):
     """Standalone MXFP8 fake-quant linear (mirrors MXFP8Linear.forward).
 

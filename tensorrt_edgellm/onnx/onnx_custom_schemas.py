@@ -748,6 +748,64 @@ _int4_groupwise_gemm_v2_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
+# trt_edgellm::FP8BlockGemmPlugin (Qwen3 / DeepSeek 2-D block-wise FP8 GEMM)
+# ---------------------------------------------------------------------------
+
+_fp8_block_gemm_schema = OpSchema(
+    name="FP8BlockGemmPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="TensorRT block-wise FP8 GEMM plugin (dynamic per-token activation "
+    "quantize + 128x128 block weight scales; Blackwell tcgen05).",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="input",
+            description="Activation tensor [b, seq, K] (float16)",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="weight",
+            description="FP8 E4M3 weight bytes [N, K] (int8 bit view)",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="weight_scale_inv",
+            description=
+            "Per-128x128-block weight scales [N/128, K/128] (float32)",
+            type_str="tensor(float)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="Output tensor [b, seq, N]",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"],
+            "Input and output data type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="gemm_n",
+            type=OpSchema.AttrType.INT,
+            description="Output feature dimension (N)",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="gemm_k",
+            type=OpSchema.AttrType.INT,
+            description="Input feature dimension (K)",
+            required=True,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # trt_edgellm::Nvfp4A16GemmPlugin (dense FP16-A / NVFP4-W4 Marlin GEMM)
 # ---------------------------------------------------------------------------
 
@@ -1881,6 +1939,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _int4_groupwise_gemm_schema,
     _qkv_concat_schema,
     _int4_groupwise_gemm_v2_schema,
+    _fp8_block_gemm_schema,
     _nvfp4_a16_gemm_schema,
     _causal_conv1d_schema,
     _update_ssm_state_schema,

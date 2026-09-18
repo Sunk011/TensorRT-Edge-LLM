@@ -80,9 +80,10 @@ import os
 
 import torch
 from golden_quant_linears import (_detect_gptq_zero_point_offset,
-                                  _GoldenAWQLinear, _GoldenFP8Linear,
-                                  _GoldenGPTQLinear, _GoldenINT8SQLinear,
-                                  _GoldenMXFP8Linear, _GoldenNVFP4Linear)
+                                  _GoldenAWQLinear, _GoldenFP8BlockLinear,
+                                  _GoldenFP8Linear, _GoldenGPTQLinear,
+                                  _GoldenINT8SQLinear, _GoldenMXFP8Linear,
+                                  _GoldenNVFP4Linear)
 from safetensors.torch import load_file, save_file
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -583,6 +584,7 @@ def _load_quantized_state(model: torch.nn.Module, ckpt: str) -> None:
     counts = {
         "NVFP4": 0,
         "FP8": 0,
+        "FP8BLOCK": 0,
         "MXFP8": 0,
         "INT8SQ": 0,
         "AWQ": 0,
@@ -610,6 +612,10 @@ def _load_quantized_state(model: torch.nn.Module, ckpt: str) -> None:
         elif f"{prefix}.weight_scale_2" in state:
             new = _GoldenNVFP4Linear(in_f, out_f, has_bias)
             counts["NVFP4"] += 1
+        elif f"{prefix}.weight_scale_inv" in state:
+            # Qwen3 / DeepSeek 2-D block-wise FP8: [N/128, K/128] fp32 scales.
+            new = _GoldenFP8BlockLinear(in_f, out_f, has_bias)
+            counts["FP8BLOCK"] += 1
         elif state[f"{prefix}.weight_scale"].dtype == torch.uint8:
             new = _GoldenMXFP8Linear(in_f, out_f, has_bias)
             counts["MXFP8"] += 1

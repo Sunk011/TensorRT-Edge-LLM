@@ -552,6 +552,9 @@ def _initializer_dtype_fixup_required(
                     plugin_fp32_init_names.add(node.input[input_idx])
         if node.op_type == "Fp16MoePlugin" and len(node.input) > 4:
             plugin_fp32_init_names.add(node.input[4])
+        if node.op_type == "FP8BlockGemmPlugin" and len(node.input) > 2:
+            plugin_fp32_init_names.add(
+                node.input[2])  # weight_scale_inv (FP32)
 
     init_map = {init.name: init for init in model.graph.initializer}
     elem_types: dict[str, int] = {}
@@ -841,6 +844,9 @@ def _fix_initializer_dtypes(
             plugin_fp32_init_names.add(node.input[8])
         if node.op_type == "Fp16MoePlugin" and len(node.input) > 4:
             plugin_fp32_init_names.add(node.input[4])
+        if node.op_type == "FP8BlockGemmPlugin" and len(node.input) > 2:
+            plugin_fp32_init_names.add(
+                node.input[2])  # weight_scale_inv (FP32)
 
     init_map = {init.name: init for init in model.graph.initializer}
     elem_types: dict[str, int] = {}

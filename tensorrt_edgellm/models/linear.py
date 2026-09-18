@@ -34,19 +34,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..config import (QUANT_FP8, QUANT_FP16, QUANT_INT4_AWQ,
+from ..config import (QUANT_FP8, QUANT_FP8_BLOCK, QUANT_FP16, QUANT_INT4_AWQ,
                       QUANT_INT4_AWQ_MODELOPT, QUANT_INT4_GPTQ, QUANT_INT8_SQ,
                       QUANT_MXFP8, QUANT_NVFP4, QUANT_NVFP4_A16, Mapping,
-                      ModelConfig, module_quant_type,
-                      QUANT_FP8_BLOCK,   # 新增
-                      )
-from .ops import (fp8_dequantize, fp8_quantize, fused_nvfp4_gemm_allreduce,
-                  int4_gemm_plugin_version, int4_groupwise_gemm,
-                  int4_groupwise_gemm_v2, int8_sq_act_qdq, int8_sq_weight_dq,
-                  mxfp8_act_qdq, mxfp8_weight_dq, nvfp4_a16_gemm,
-                  nvfp4_act_qdq, nvfp4_dequantize,
-                  fp8_block_dequantize,  # 新增
-                  )
+                      ModelConfig, module_quant_type)
+from .ops import (fp8_block_gemm, fp8_dequantize, fp8_quantize,
+                  fused_nvfp4_gemm_allreduce, int4_gemm_plugin_version,
+                  int4_groupwise_gemm, int4_groupwise_gemm_v2, int8_sq_act_qdq,
+                  int8_sq_weight_dq, mxfp8_act_qdq, mxfp8_weight_dq,
+                  nvfp4_a16_gemm, nvfp4_act_qdq, nvfp4_dequantize)
 
 logger = logging.getLogger(__name__)
 
@@ -83,8 +79,8 @@ __all__ = [
     "is_int4_linear",
     "FP16Linear",
     "FP8Linear",
-    "FP8BlockLinear",           # 新增
-    "repack_fp8_block_weights", # 新增
+    "FP8BlockLinear",
+    "prepare_fp8_block_weights",
     "MXFP8Linear",
     "AWQLinear",
     "ModelOptAWQPrepackedLinear",
@@ -242,29 +238,27 @@ class FP8Linear(LinearBase):
         bias = self.bias.to(torch.float16) if self.bias is not None else None
         return F.linear(hidden_states_dq, w_fp16, bias)
 
+
 # 新增
 class FP8BlockLinear(LinearBase):
-    """2-D block-wise FP8 weight-only Linear.
+    """2-D block-wise FP8 Linear (Qwen3 / DeepSeek recipe).
 
-    Original checkpoint layout:
+    Native checkpoint layout, used verbatim (no repack):
 
-        weight            [N, K]       float8_e4m3fn
-        weight_scale_inv  [N/BN, K/BK] float32
+        weight             [N, K]         float8_e4m3fn
+        weight_scale_inv   [N/128, K/128] float32
 
-    Export layout after repack_for_export():
-
-        weight            [num_blocks, BN * BK]
-        weight_scale_inv  [num_blocks]
-
-    where typically BN = BK = 128.
+    ``forward`` emits ``trt::fp8_block_gemm`` -> ``FP8BlockGemmPlugin``, which
+    dynamically quantizes the activation (per-token, per-128-K) and runs a true
+    FP8 tensor-core GEMM with 128x128 block weight scales on Blackwell.
     """
 
     def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        block_size=(128, 128),
-        bias: bool = False,
+            self,
+            in_features: int,
+            out_features: int,
+            block_size=(128, 128),
+            bias: bool = False,
     ) -> None:
         super().__init__()
 
@@ -279,26 +273,19 @@ class FP8BlockLinear(LinearBase):
         block_n, block_k = self.block_size
 
         if out_features % block_n != 0:
-            raise ValueError(
-                f"out_features={out_features} must be divisible "
-                f"by block_n={block_n}"
-            )
+            raise ValueError(f"out_features={out_features} must be divisible "
+                             f"by block_n={block_n}")
 
         if in_features % block_k != 0:
-            raise ValueError(
-                f"in_features={in_features} must be divisible "
-                f"by block_k={block_k}"
-            )
+            raise ValueError(f"in_features={in_features} must be divisible "
+                             f"by block_k={block_k}")
 
         out_blocks = out_features // block_n
         in_blocks = in_features // block_k
 
-        # ---------------------------------------------------------
-        # 注意：
-        # 这里仍然按照 checkpoint 原始 shape 创建。
-        # loader 首先把 [N, K] checkpoint weight 加载进来。
-        # 后面 repack_for_export() 再改布局。
-        # ---------------------------------------------------------
+        # Buffers keep the native checkpoint layout ([N, K] fp8 weight +
+        # [N/128, K/128] fp32 scale); the loader fills them verbatim and
+        # prepare_fp8_block_weights() bit-views the weight to int8 pre-export.
         self.register_buffer(
             "weight",
             torch.empty(
@@ -328,342 +315,42 @@ class FP8BlockLinear(LinearBase):
         else:
             self.bias = None
 
-        self._block_weight_repacked = False
-
-
-    def repack_for_export(self) -> None:
-        """Offline repack FP8 weight into block-major layout.
-
-        [N, K]
-          ↓ reshape
-        [Nb, BN, Kb, BK]
-          ↓ permute
-        [Nb, Kb, BN, BK]
-          ↓ reshape
-        [Nb * Kb, BN * BK]
-
-        This happens BEFORE torch.onnx.export so the FP8 ONNX initializer
-        itself is already block-major and can feed DequantizeLinear directly.
-        """
-
-        if self._block_weight_repacked:
-            return
-
-        block_n, block_k = self.block_size
-
-        out_blocks = self.out_features // block_n
-        in_blocks = self.in_features // block_k
-
-        expected_weight_shape = (
-            self.out_features,
-            self.in_features,
-        )
-
-        expected_scale_shape = (
-            out_blocks,
-            in_blocks,
-        )
-
-        if tuple(self.weight.shape) != expected_weight_shape:
-            raise RuntimeError(
-                "FP8BlockLinear weight has unexpected pre-repack shape: "
-                f"got {tuple(self.weight.shape)}, "
-                f"expected {expected_weight_shape}"
-            )
-
-        if tuple(self.weight_scale_inv.shape) != expected_scale_shape:
-            raise RuntimeError(
-                "FP8BlockLinear weight_scale_inv has unexpected shape: "
-                f"got {tuple(self.weight_scale_inv.shape)}, "
-                f"expected {expected_scale_shape}"
-            )
-
-        # [N, K]
-        # ->
-        # [Nb, BN, Kb, BK]
-        weight = self.weight.reshape(
-            out_blocks,
-            block_n,
-            in_blocks,
-            block_k,
-        )
-
-        # ->
-        # [Nb, Kb, BN, BK]
-        weight = weight.permute(
-            0, 2, 1, 3
-        ).contiguous()
-
-        # ->
-        # [num_blocks, block_n * block_k]
-        weight = weight.reshape(
-            out_blocks * in_blocks,
-            block_n * block_k,
-        )
-
-        scale = self.weight_scale_inv.reshape(
-            out_blocks * in_blocks
-        ).contiguous()
-
-        # 保持为 registered buffer
-        self._buffers["weight"] = weight
-        self._buffers["weight_scale_inv"] = scale
-
-        self._block_weight_repacked = True
-
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-
-        _require_fp16_input(
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        _require_fp16_input(hidden_states, "FP8BlockLinear")
+        # ``self.weight`` is the fp8 checkpoint weight, bit-viewed to int8 by
+        # ``prepare_fp8_block_weights`` before export (the plugin's kINT8 weight
+        # input). ``weight_scale_inv`` stays fp32 [N/128, K/128]. The op maps to
+        # trt_edgellm::FP8BlockGemmPlugin; the activation is quantized inside
+        # the plugin, so no explicit act scale is passed.
+        out = fp8_block_gemm(
             hidden_states,
-            "FP8BlockLinear",
-        )
-
-        block_n, block_k = self.block_size
-
-        out_blocks = self.out_features // block_n
-        in_blocks = self.in_features // block_k
-
-        expected_weight_shape = (
-            out_blocks * in_blocks,
-            block_n * block_k,
-        )
-
-        expected_scale_shape = (
-            out_blocks * in_blocks,
-        )
-
-        if tuple(self.weight.shape) != expected_weight_shape:
-            raise RuntimeError(
-                "FP8BlockLinear must be repacked before forward/export. "
-                f"weight shape={tuple(self.weight.shape)}, "
-                f"expected={expected_weight_shape}"
-            )
-
-        if tuple(self.weight_scale_inv.shape) != expected_scale_shape:
-            raise RuntimeError(
-                "FP8BlockLinear scale must be repacked before forward/export. "
-                f"scale shape={tuple(self.weight_scale_inv.shape)}, "
-                f"expected={expected_scale_shape}"
-            )
-
-        # ----------------------------------------------------------
-        # IMPORTANT
-        #
-        # FP8 constant 直接进入 DequantizeLinear。
-        #
-        # ONNX:
-        #
-        # FP8 initializer
-        #        ↓
-        # DequantizeLinear
-        #
-        # 前面绝对不能有 Reshape / Transpose。
-        # ----------------------------------------------------------
-        weight_blocks = fp8_block_dequantize(
             self.weight,
             self.weight_scale_inv,
-        )
-
-        # 现在已经是 FP16，随便 reshape / transpose 都没问题
-        weight = weight_blocks.reshape(
-            out_blocks,
-            in_blocks,
-            block_n,
-            block_k,
-        )
-
-        weight = weight.permute(
-            0, 2, 1, 3
-        ).contiguous()
-
-        weight = weight.reshape(
             self.out_features,
             self.in_features,
         )
-
-        bias = (
-            self.bias.to(torch.float16)
-            if self.bias is not None
-            else None
-        )
-
-        return F.linear(
-            hidden_states,
-            weight,
-            bias,
-        )
+        if self.bias is not None:
+            out = out + self.bias.to(torch.float16)
+        return out
 
 
-def repack_fp8_block_weights(model: nn.Module) -> int:
-    """Repack every FP8BlockLinear weight before ONNX export."""
+def prepare_fp8_block_weights(model: nn.Module) -> int:
+    """Bit-view every FP8BlockLinear weight fp8 -> int8 before ONNX export.
 
+    Runs after QKV fusion so concatenated weights are viewed once. The FP8
+    bytes are unchanged; the int8 view is what the plugin's kINT8 weight input
+    expects. ``weight_scale_inv`` stays fp32 ``[N/128, K/128]``.
+    """
     count = 0
-
     for module in model.modules():
         if isinstance(module, FP8BlockLinear):
-            module.repack_for_export()
+            w = module._buffers.get("weight")
+            if w is not None and w.dtype == torch.float8_e4m3fn:
+                module._buffers["weight"] = w.view(torch.int8)
             count += 1
-
-    logger.info(
-        "Repacked %d FP8BlockLinear weights to block-major layout",
-        count,
-    )
-
+    logger.info("Prepared %d FP8BlockLinear weights (fp8 -> int8 view)", count)
     return count
 
-
-# class FP8BlockLinear(LinearBase):
-#     """2-D block-wise FP8 weight-only Linear.
-
-#     Qwen fine-grained FP8 layout:
-
-#         weight            [N, K]       float8_e4m3fn
-#         weight_scale_inv  [N/BN, K/BK] float32
-
-#     where block_size = (BN, BK), typically (128, 128).
-#     """
-
-#     def __init__(
-#         self,
-#         in_features: int,
-#         out_features: int,
-#         block_size=(128, 128),
-#         bias: bool = False,
-#     ) -> None:
-#         super().__init__()
-
-#         self.in_features = in_features
-#         self.out_features = out_features
-
-#         self.block_size = (
-#             int(block_size[0]),
-#             int(block_size[1]),
-#         )
-
-#         block_n, block_k = self.block_size
-
-#         if out_features % block_n != 0:
-#             raise ValueError(
-#                 f"out_features={out_features} must be divisible "
-#                 f"by block_n={block_n}"
-#             )
-
-#         if in_features % block_k != 0:
-#             raise ValueError(
-#                 f"in_features={in_features} must be divisible "
-#                 f"by block_k={block_k}"
-#             )
-
-#         out_blocks = out_features // block_n
-#         in_blocks = in_features // block_k
-
-#         self.register_buffer(
-#             "weight",
-#             torch.empty(
-#                 out_features,
-#                 in_features,
-#                 dtype=torch.float8_e4m3fn,
-#             ),
-#         )
-
-#         self.register_buffer(
-#             "weight_scale_inv",
-#             torch.ones(
-#                 out_blocks,
-#                 in_blocks,
-#                 dtype=torch.float32,
-#             ),
-#         )
-
-#         if bias:
-#             self.register_buffer(
-#                 "bias",
-#                 torch.empty(
-#                     out_features,
-#                     dtype=torch.float16,
-#                 ),
-#             )
-#         else:
-#             self.bias = None
-
-#     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-#         _require_fp16_input(
-#             hidden_states,
-#             "FP8BlockLinear",
-#         )
-
-#         block_n, block_k = self.block_size
-
-#         out_blocks = self.out_features // block_n
-#         in_blocks = self.in_features // block_k
-
-#         # ------------------------------------------------
-#         # [N, K]
-#         #
-#         # -> [Nb, BN, Kb, BK]
-#         # -> [Nb, Kb, BN, BK]
-#         # -> [Nb * Kb, BN * BK]
-#         #
-#         # 每一行正好对应一个 128x128 block
-#         # ------------------------------------------------
-
-#         weight_blocks = self.weight.reshape(
-#             out_blocks,
-#             block_n,
-#             in_blocks,
-#             block_k,
-#         )
-
-#         weight_blocks = weight_blocks.permute(
-#             0, 2, 1, 3
-#         ).contiguous()
-
-#         weight_blocks = weight_blocks.reshape(
-#             out_blocks * in_blocks,
-#             block_n * block_k,
-#         )
-
-#         scales = self.weight_scale_inv.reshape(
-#             out_blocks * in_blocks
-#         )
-
-#         weight_blocks = fp8_block_dequantize(
-#             weight_blocks,
-#             scales,
-#         )
-
-#         # inverse transform
-#         weight = weight_blocks.reshape(
-#             out_blocks,
-#             in_blocks,
-#             block_n,
-#             block_k,
-#         )
-
-#         weight = weight.permute(
-#             0, 2, 1, 3
-#         ).contiguous()
-
-#         weight = weight.reshape(
-#             self.out_features,
-#             self.in_features,
-#         )
-
-#         bias = (
-#             self.bias.to(torch.float16)
-#             if self.bias is not None
-#             else None
-#         )
-
-#         return F.linear(
-#             hidden_states,
-#             weight,
-#             bias,
-#         )
 
 # ---------------------------------------------------------------------------
 # NVFP4LinearMethod
@@ -1286,7 +973,12 @@ def make_linear(
     elif quant_type == QUANT_FP8:
         layer = FP8Linear(in_features, out_features, bias)
     elif quant_type == QUANT_FP8_BLOCK:
-        layer = FP8BlockLinear(in_features, out_features, block_size=config.quant.block_size, bias=bias,)
+        layer = FP8BlockLinear(
+            in_features,
+            out_features,
+            block_size=config.quant.block_size,
+            bias=bias,
+        )
     elif quant_type == QUANT_MXFP8:
         layer = MXFP8Linear(in_features, out_features, config.quant.group_size,
                             bias)

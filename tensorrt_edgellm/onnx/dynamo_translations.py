@@ -157,30 +157,25 @@ def _fp8_dequantize_translation(
 
 
 # ---------------------------------------------------------------------------
-# FP8 block ops
+# FP8 block-wise GEMM op
 # ---------------------------------------------------------------------------
 @script()
-def _fp8_block_dequantize_translation(
-    x: onnxscript.FLOAT8E4M3FN,
-    scale: onnxscript.FLOAT,
+def _fp8_block_gemm_translation(
+    hidden_states: onnxscript.FLOAT16,
+    weight: onnxscript.INT8,
+    weight_scale_inv: onnxscript.FLOAT,
+    gemm_n: int,
+    gemm_k: int,
 ) -> onnxscript.FLOAT16:
-
-    # x:
-    # [num_blocks, block_n * block_k]
-    #
-    # scale:
-    # [num_blocks]
-    #
-    # 每一行使用一个 scale
-    dq = _op21.DequantizeLinear(
-        x,
-        scale,
-        axis=0,
-    )
-
-    return _op21.Cast(
-        dq,
-        to=int(onnx.TensorProto.FLOAT16),
+    # hidden_states: [b, seq, K] fp16; weight: [N, K] int8 (fp8 bits);
+    # weight_scale_inv: [N/128, K/128] fp32. Emits the block-wise FP8 GEMM
+    # plugin (dynamic per-token activation quantize + 128x128 block scales).
+    return _trt_edgellm.FP8BlockGemmPlugin(
+        hidden_states,
+        weight,
+        weight_scale_inv,
+        gemm_n=gemm_n,
+        gemm_k=gemm_k,
     )
 
 
@@ -1372,8 +1367,8 @@ def build_custom_translation_table() -> dict:
         _fp8_quantize_translation,
         torch.ops.trt.fp8_dequantize.default:
         _fp8_dequantize_translation,
-        torch.ops.trt.fp8_block_dequantize.default:
-        _fp8_block_dequantize_translation,
+        torch.ops.trt.fp8_block_gemm.default:
+        _fp8_block_gemm_translation,
         torch.ops.trt.nvfp4_act_qdq.default:
         _nvfp4_act_qdq_translation,
         torch.ops.trt.nvfp4_dequantize.default:
