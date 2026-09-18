@@ -11,3 +11,7 @@
 	path = 3rdParty/NVTX
 	revision = 2fb879e512ed208f83c6aa4d4c96b958789edf49
 	url = https://github.com/NVIDIA/NVTX.git
+[submodule "3rdParty/cutlass"]
+	path = 3rdParty/cutlass
+	revision = 1afc6d355b8cb992398f17beb4425702f1d57ddd
+	url = https://github.com/NVIDIA/cutlass.git
