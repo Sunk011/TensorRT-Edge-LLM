@@ -94,6 +94,36 @@ using StrideA = typename Gemm::GemmKernel::StrideA;
 using StrideB = typename Gemm::GemmKernel::StrideB;
 using StrideD = typename Gemm::GemmKernel::StrideD;
 
+constexpr int32_t k2CtaM{4096};
+constexpr int32_t k2CtaN{2560};
+constexpr int32_t k2CtaK{9728};
+
+using MmaTileShape2Cta_MNK = Shape<_256, _256, _128>;
+using ClusterShape2Cta_MNK = Shape<_2, _1, _1>;
+using ScaleConfig2Cta = cutlass::detail::Sm100BlockwiseScaleConfig<1, 128, 128, UMMA::Major::MN, UMMA::Major::MN>;
+using LayoutSFA2Cta = decltype(ScaleConfig2Cta::deduce_layoutSFA());
+using LayoutSFB2Cta = decltype(ScaleConfig2Cta::deduce_layoutSFB());
+
+using CollectiveEpilogue2Cta = typename cutlass::epilogue::collective::CollectiveBuilder<cutlass::arch::Sm100,
+    cutlass::arch::OpClassTensorOp, MmaTileShape2Cta_MNK, ClusterShape2Cta_MNK,
+    cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute, void, LayoutD, kAlignD,
+    ElementD, LayoutD, kAlignD, cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+
+using CollectiveMainloop2Cta = typename cutlass::gemm::collective::CollectiveBuilder<cutlass::arch::Sm100,
+    cutlass::arch::OpClassTensorOp, ElementA, cute::tuple<LayoutA, LayoutSFA2Cta>, kAlignA, ElementB,
+    cute::tuple<LayoutB, LayoutSFB2Cta>, kAlignB, ElementAccumulator, MmaTileShape2Cta_MNK, ClusterShape2Cta_MNK,
+    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+        sizeof(typename CollectiveEpilogue2Cta::SharedStorage))>,
+    cutlass::gemm::KernelTmaWarpSpecializedBlockwise2SmSm100>::CollectiveOp;
+
+using GemmKernel2Cta = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop2Cta,
+    CollectiveEpilogue2Cta, void>;
+using Gemm2Cta = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel2Cta>;
+
+using StrideA2Cta = typename Gemm2Cta::GemmKernel::StrideA;
+using StrideB2Cta = typename Gemm2Cta::GemmKernel::StrideB;
+using StrideD2Cta = typename Gemm2Cta::GemmKernel::StrideD;
+
 // Blackwell datacenter archs with tcgen05: SM100/101/103 (major 10) and
 // SM110 = Thor (major 11). SM120/121 (major 12, GeForce Blackwell) lack
 // tcgen05 and are excluded.
@@ -139,6 +169,29 @@ typename Gemm::Arguments makeArguments(
     return args;
 }
 
+bool is2CtaShape(int32_t M, int32_t N, int32_t K)
+{
+    return M == k2CtaM && N == k2CtaN && K == k2CtaK;
+}
+
+typename Gemm2Cta::Arguments make2CtaArguments(void const* A, void const* SFA, void const* B, void const* SFB, void* D)
+{
+    auto stride_A = cutlass::make_cute_packed_stride(StrideA2Cta{}, {k2CtaM, k2CtaK, 1});
+    auto stride_B = cutlass::make_cute_packed_stride(StrideB2Cta{}, {k2CtaN, k2CtaK, 1});
+    auto stride_D = cutlass::make_cute_packed_stride(StrideD2Cta{}, {k2CtaM, k2CtaN, 1});
+    auto layout_SFA = ScaleConfig2Cta::tile_atom_to_shape_SFA(make_shape(k2CtaM, k2CtaN, k2CtaK, 1));
+    auto layout_SFB = ScaleConfig2Cta::tile_atom_to_shape_SFB(make_shape(k2CtaM, k2CtaN, k2CtaK, 1));
+
+    typename Gemm2Cta::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm, {k2CtaM, k2CtaN, k2CtaK, 1},
+        {static_cast<ElementA const*>(A), stride_A, static_cast<ElementB const*>(B), stride_B,
+            static_cast<ElementAccumulator const*>(SFA), layout_SFA, static_cast<ElementAccumulator const*>(SFB),
+            layout_SFB},
+        {{}, nullptr, stride_D, static_cast<ElementD*>(D), stride_D}};
+    args.epilogue.thread.alpha = 1.0f;
+    args.epilogue.thread.beta = 0.0f;
+    return args;
+}
+
 } // namespace
 
 bool fp8BlockwiseGemmSupported()
@@ -154,6 +207,21 @@ size_t fp8BlockwiseGemmWorkspaceSize(int32_t M, int32_t N, int32_t K)
     }
     auto args = makeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K);
     return static_cast<size_t>(Gemm::get_workspace_size(args));
+}
+
+bool fp8BlockwiseGemm2CtaSupported(int32_t M, int32_t N, int32_t K)
+{
+    return deviceIsBlackwellDatacenter() && is2CtaShape(M, N, K);
+}
+
+size_t fp8BlockwiseGemm2CtaWorkspaceSize(int32_t M, int32_t N, int32_t K)
+{
+    if (!fp8BlockwiseGemm2CtaSupported(M, N, K))
+    {
+        return 0;
+    }
+    auto args = make2CtaArguments(nullptr, nullptr, nullptr, nullptr, nullptr);
+    return static_cast<size_t>(Gemm2Cta::get_workspace_size(args));
 }
 
 void launchFp8BlockwiseGemm(void const* A, void const* SFA, void const* B, void const* SFB, void* D, int32_t M,
@@ -184,6 +252,29 @@ void launchFp8BlockwiseGemm(void const* A, void const* SFA, void const* B, void 
     }
 }
 
+void launchFp8BlockwiseGemm2Cta(void const* A, void const* SFA, void const* B, void const* SFB, void* D, int32_t M,
+    int32_t N, int32_t K, void* workspace, size_t workspaceSize, cudaStream_t stream)
+{
+    if (!fp8BlockwiseGemm2CtaSupported(M, N, K))
+    {
+        throw std::runtime_error("FP8 blockwise 2-CTA GEMM only supports M=4096, N=2560, K=9728.");
+    }
+
+    auto args = make2CtaArguments(A, SFA, B, SFB, D);
+    Gemm2Cta gemm;
+    size_t const required = static_cast<size_t>(Gemm2Cta::get_workspace_size(args));
+    if (required > workspaceSize)
+    {
+        throw std::runtime_error(
+            "FP8 blockwise 2-CTA GEMM workspace too small: need " + std::to_string(required) + " bytes.");
+    }
+    cutlass::Status status = gemm.run(args, workspace, stream);
+    if (status != cutlass::Status::kSuccess)
+    {
+        throw std::runtime_error(std::string("FP8 blockwise 2-CTA GEMM failed: ") + cutlassGetStatusString(status));
+    }
+}
+
 } // namespace kernel
 } // namespace trt_edgellm
 
@@ -204,11 +295,29 @@ size_t fp8BlockwiseGemmWorkspaceSize(int32_t, int32_t, int32_t)
     return 0;
 }
 
+bool fp8BlockwiseGemm2CtaSupported(int32_t, int32_t, int32_t)
+{
+    return false;
+}
+
+size_t fp8BlockwiseGemm2CtaWorkspaceSize(int32_t, int32_t, int32_t)
+{
+    return 0;
+}
+
 void launchFp8BlockwiseGemm(
     void const*, void const*, void const*, void const*, void*, int32_t, int32_t, int32_t, void*, size_t, cudaStream_t)
 {
     throw std::runtime_error(
         "FP8 blockwise GEMM kernel was not compiled for this target arch (needs Blackwell datacenter SM100/SM110).");
+}
+
+void launchFp8BlockwiseGemm2Cta(
+    void const*, void const*, void const*, void const*, void*, int32_t, int32_t, int32_t, void*, size_t, cudaStream_t)
+{
+    throw std::runtime_error(
+        "FP8 blockwise 2-CTA GEMM kernel was not compiled for this target arch (needs Blackwell datacenter "
+        "SM100/SM110).");
 }
 
 } // namespace kernel

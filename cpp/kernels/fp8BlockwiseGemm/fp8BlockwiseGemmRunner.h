@@ -49,6 +49,12 @@ bool fp8BlockwiseGemmSupported();
 //! (currently 0 for the 1x1x1-cluster configuration, but queried dynamically).
 size_t fp8BlockwiseGemmWorkspaceSize(int32_t M, int32_t N, int32_t K);
 
+//! @return true iff the fixed 4096x2560x9728 2-CTA specialization is usable.
+bool fp8BlockwiseGemm2CtaSupported(int32_t M, int32_t N, int32_t K);
+
+//! @return workspace bytes required by the fixed 2-CTA specialization.
+size_t fp8BlockwiseGemm2CtaWorkspaceSize(int32_t M, int32_t N, int32_t K);
+
 //! Launch the block-wise FP8 GEMM. Throws std::runtime_error on misuse
 //! (unsupported device, invalid shape) or CUTLASS failure.
 //! @param A     FP8 E4M3 activations ``[M,K]`` (bytes).
@@ -57,6 +63,11 @@ size_t fp8BlockwiseGemmWorkspaceSize(int32_t M, int32_t N, int32_t K);
 //! @param SFB   FP32 weight scales ``[N/128, K/128]`` row-major.
 //! @param D     FP16 output ``[M,N]`` row-major.
 void launchFp8BlockwiseGemm(void const* A, void const* SFA, void const* B, void const* SFB, void* D, int32_t M,
+    int32_t N, int32_t K, void* workspace, size_t workspaceSize, cudaStream_t stream);
+
+//! Launches the fixed 2-CTA specialization. SFA and SFB use MN-major layouts:
+//! ``SFA[K/128, M]`` and ``SFB[K/128, N/128]``.
+void launchFp8BlockwiseGemm2Cta(void const* A, void const* SFA, void const* B, void const* SFB, void* D, int32_t M,
     int32_t N, int32_t K, void* workspace, size_t workspaceSize, cudaStream_t stream);
 
 } // namespace kernel

@@ -19,6 +19,7 @@
 
 #include "common/logger.h"
 #include "kernels/fp8BlockwiseGemm/fp8BlockwiseGemmRunner.h"
+#include "kernels/fp8BlockwiseGemm/fp8BlockwiseScaleTranspose.h"
 #include "kernels/fp8BlockwiseGemm/fp8PerTokenGroupQuantize.h"
 
 #include <cuda_runtime.h>
@@ -239,8 +240,18 @@ size_t FP8BlockGemmPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* input
         int64_t const kb = mGemmK / kBLOCK_SIZE;
         size_t const aBytes = alignUp(static_cast<size_t>(mMax) * static_cast<size_t>(mGemmK), kAlign);
         size_t const sfaBytes = alignUp(static_cast<size_t>(mMax) * static_cast<size_t>(kb) * sizeof(float), kAlign);
-        size_t const cutlassBytes = kernel::fp8BlockwiseGemmWorkspaceSize(static_cast<int32_t>(mMax), mGemmN, mGemmK);
-        return aBytes + sfaBytes + cutlassBytes;
+        bool const use2Cta = kernel::fp8BlockwiseGemm2CtaSupported(static_cast<int32_t>(mMax), mGemmN, mGemmK);
+        if (!use2Cta)
+        {
+            size_t const cutlassBytes
+                = kernel::fp8BlockwiseGemmWorkspaceSize(static_cast<int32_t>(mMax), mGemmN, mGemmK);
+            return aBytes + sfaBytes + cutlassBytes;
+        }
+        int64_t const nb = mGemmN / kBLOCK_SIZE;
+        size_t const sfbBytes = alignUp(static_cast<size_t>(nb) * static_cast<size_t>(kb) * sizeof(float), kAlign);
+        size_t const cutlassBytes
+            = kernel::fp8BlockwiseGemm2CtaWorkspaceSize(static_cast<int32_t>(mMax), mGemmN, mGemmK);
+        return aBytes + sfaBytes + sfaBytes + sfbBytes + cutlassBytes;
     }
     catch (std::exception const& e)
     {
@@ -274,14 +285,32 @@ int32_t FP8BlockGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTen
         size_t const aBytes = alignUp(static_cast<size_t>(M) * static_cast<size_t>(K), kAlign);
         float* sfa = reinterpret_cast<float*>(base + aBytes);
         size_t const sfaBytes = alignUp(static_cast<size_t>(M) * static_cast<size_t>(kb) * sizeof(float), kAlign);
-        void* cutlassWs = static_cast<void*>(base + aBytes + sfaBytes);
-        size_t const cutlassWsSize = kernel::fp8BlockwiseGemmWorkspaceSize(M, N, K);
 
         // 1) Dynamic per-token, per-128-K-group activation quantization (fp16 -> fp8 + SFA).
         kernel::launchFp8PerTokenGroupQuantize(inputs[0], aFp8, sfa, M, K, stream);
-        // 2) CUTLASS SM100 blockwise FP8 GEMM: D[M,N] = dequant(A) @ dequant(weight)^T.
-        kernel::launchFp8BlockwiseGemm(
-            aFp8, sfa, inputs[1], inputs[2], outputs[0], M, N, K, cutlassWs, cutlassWsSize, stream);
+
+        if (kernel::fp8BlockwiseGemm2CtaSupported(M, N, K))
+        {
+            int64_t const nb = N / kBLOCK_SIZE;
+            auto* sfaMn = reinterpret_cast<float*>(base + aBytes + sfaBytes);
+            size_t const sfbBytes = alignUp(static_cast<size_t>(nb) * static_cast<size_t>(kb) * sizeof(float), kAlign);
+            auto* sfbMn = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(sfaMn) + sfaBytes);
+            void* cutlassWs = static_cast<void*>(reinterpret_cast<uint8_t*>(sfbMn) + sfbBytes);
+            size_t const cutlassWsSize = kernel::fp8BlockwiseGemm2CtaWorkspaceSize(M, N, K);
+
+            kernel::launchFp8BlockwiseScaleTranspose(sfa, sfaMn, M, static_cast<int32_t>(kb), stream);
+            kernel::launchFp8BlockwiseScaleTranspose(static_cast<float const*>(inputs[2]), sfbMn,
+                static_cast<int32_t>(nb), static_cast<int32_t>(kb), stream);
+            kernel::launchFp8BlockwiseGemm2Cta(
+                aFp8, sfaMn, inputs[1], sfbMn, outputs[0], M, N, K, cutlassWs, cutlassWsSize, stream);
+        }
+        else
+        {
+            void* cutlassWs = static_cast<void*>(base + aBytes + sfaBytes);
+            size_t const cutlassWsSize = kernel::fp8BlockwiseGemmWorkspaceSize(M, N, K);
+            kernel::launchFp8BlockwiseGemm(
+                aFp8, sfa, inputs[1], inputs[2], outputs[0], M, N, K, cutlassWs, cutlassWsSize, stream);
+        }
         return 0;
     }
     catch (std::exception const& e)
