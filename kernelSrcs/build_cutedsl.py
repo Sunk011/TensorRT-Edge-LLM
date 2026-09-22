@@ -27,6 +27,7 @@ Kernel groups:
   f16_moe          — FP16 grouped FC1/FC2 MoE (Ampere / Blackwell / SM12x)
   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
   nvfp4_a16_blackwell_gemm — SM110 dense NVFP4-weight FP16/BF16 GEMM
+  fp8_block_gemm   — FP8 E4M3 GEMM with FP32 1x128/128x128 block scales
   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
   rmsnorm          — FP16/BF16 RMSNorm for production hidden sizes
 
@@ -97,7 +98,8 @@ class KernelVariant:
         name:          Unique identifier — used as --file_name / --function_prefix.
         group:         Logical group ("gdn", "fmha", "f16_moe",
                        "nvfp4_fused_moe", "nvfp4_moe", "rmsnorm", "ssd",
-                       "nvfp4_a16_blackwell_gemm", or "gemm").
+                       "nvfp4_a16_blackwell_gemm", "fp8_block_gemm", or
+                       "gemm").
                        cmake sets CUTE_DSL_<GROUP>_ENABLED for integrated groups.
         supported_sms: Explicit SM whitelist. With --kernels ALL, only variants whose
                        supported_sms contains the detected/requested SM are compiled.
@@ -1646,6 +1648,13 @@ KERNEL_VARIANTS = [
             "--export_only",
         ],
     ),
+    KernelVariant(
+        name="fp8_blockwise_gemm_fp16",
+        group="fp8_block_gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="fp8_blockwise_gemm_cutedsl/export_kernel.py",
+        script_args=["--mnk", "128,256,128"],
+    ),
 ]
 
 
@@ -2730,7 +2739,7 @@ def main():
         default="ALL",
         help="Which kernels to build: ALL (default), a group name "
              "(fmha | gdn | f16_moe | nvfp4_moe | "
-             "nvfp4_a16_blackwell_gemm | nvfp4_fused_moe | rmsnorm | ssd | gemm | "
+             "nvfp4_a16_blackwell_gemm | fp8_block_gemm | nvfp4_fused_moe | rmsnorm | ssd | gemm | "
              "int4_fp16_gemm), or a comma-separated list "
              "of group names. "
              "Variants whose supported_sms does not include the target SM are skipped.",

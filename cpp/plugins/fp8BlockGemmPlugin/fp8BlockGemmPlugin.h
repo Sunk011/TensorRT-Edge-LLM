@@ -48,7 +48,7 @@ class FP8BlockGemmPlugin : public nvinfer1::IPluginV3,
                            public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    FP8BlockGemmPlugin(std::string const& name, int32_t N, int32_t K);
+    FP8BlockGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t backend);
     FP8BlockGemmPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
     FP8BlockGemmPlugin() = delete;
@@ -88,6 +88,7 @@ private:
     std::string mNamespace;
     int32_t mGemmN{};
     int32_t mGemmK{};
+    int32_t mBackend{};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;

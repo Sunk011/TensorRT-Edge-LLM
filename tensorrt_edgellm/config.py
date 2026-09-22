@@ -407,7 +407,7 @@ class QuantConfig:
 
     # 新增：二维 block quantization
     block_size: Tuple[int, int] = (1, 1)
-
+    fp8_block_gemm_backend: str = "cutlass"
 
     # GPTQ checkpoints are not consistent about whether qzeros stores the
     # actual zero point or (zero point - 1).  The loader uses:
@@ -2169,7 +2169,7 @@ def _detect_quantized_modules(model_dir: str) -> List[str]:
     suffixes = (
         ".qweight",
         ".weight_scale",
-        ".weight_scale_inv",   # 新增
+        ".weight_scale_inv",  # 新增
         ".weight_scale_2",
         ".input_scale",
         ".scales",
@@ -2253,7 +2253,7 @@ def _detect_modelopt_unquantized_linears(model_dir: str,
     scale_modules = {
         k.rsplit(".", 1)[0]
         for k in all_keys
-        if k.endswith((".weight_scale", ".weight_scale_inv")) # 增加
+        if k.endswith((".weight_scale", ".weight_scale_inv"))  # 增加
     }
     unquantized = weight_modules - scale_modules
 
@@ -2407,7 +2407,6 @@ def _parse_quant(model_dir: str,
                                   submodel_prefix)),
         )
 
-    
     # 新增: quant_method == fp8 with 2-D block scales
     if qc.get("quant_method") == "fp8":
         weight_block_size = qc.get("weight_block_size")
@@ -2416,24 +2415,18 @@ def _parse_quant(model_dir: str,
             if len(weight_block_size) != 2:
                 raise ValueError(
                     "FP8 weight_block_size must contain exactly 2 dimensions, "
-                    f"got {weight_block_size}"
-                )
+                    f"got {weight_block_size}")
 
             block_n = int(weight_block_size[0])
             block_k = int(weight_block_size[1])
 
             if block_n <= 0 or block_k <= 0:
                 raise ValueError(
-                    f"Invalid FP8 block size: {weight_block_size}"
-                )
+                    f"Invalid FP8 block size: {weight_block_size}")
 
-            excluded_raw = list(
-                qc.get("modules_to_not_convert", [])
-            )
+            excluded_raw = list(qc.get("modules_to_not_convert", []))
 
-            excluded_raw.extend(
-                qc.get("ignored_layers", [])
-            )
+            excluded_raw.extend(qc.get("ignored_layers", []))
 
             excluded = _effective_excluded_modules(
                 model_dir,
@@ -2443,14 +2436,11 @@ def _parse_quant(model_dir: str,
                 ),
             )
 
-            excluded.extend(
-                module
-                for module in _detect_modelopt_unquantized_linears(
-                    model_dir,
-                    submodel_prefix,
-                )
-                if module not in excluded
-            )
+            excluded.extend(module
+                            for module in _detect_modelopt_unquantized_linears(
+                                model_dir,
+                                submodel_prefix,
+                            ) if module not in excluded)
 
             return QuantConfig(
                 quant_type=QUANT_FP8_BLOCK,

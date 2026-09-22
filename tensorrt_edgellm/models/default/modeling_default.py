@@ -48,9 +48,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...config import ModelConfig
-from ..linear import (FP16Linear, NVFP4LinearMethod, ReplicatedLinear, TPMode,
-                      is_int4_linear, is_nvfp4_linear, make_linear,
-                      FP8BlockLinear,)
+from ..linear import (FP8BlockLinear, FP16Linear, NVFP4LinearMethod,
+                      ReplicatedLinear, TPMode, is_int4_linear,
+                      is_nvfp4_linear, make_linear)
 from ..ops import KV_PAGE_SIZE, attention_plugin, qkv_concat
 
 logger = logging.getLogger(__name__)
@@ -469,19 +469,13 @@ def fuse_qkv_projections(model: nn.Module) -> int:
             pass  # always fusible
         elif isinstance(first_proj, FP8BlockLinear):
             # Q/K/V must use exactly the same 2-D block layout.
-            block_sizes = [
-                proj.block_size
-                for proj in proj_modules
-            ]
+            block_sizes = [proj.block_size for proj in proj_modules]
 
-            if any(
-                block_size != first_proj.block_size
-                for block_size in block_sizes
-            ):
+            if any(block_size != first_proj.block_size
+                   for block_size in block_sizes):
                 raise RuntimeError(
                     f"QKV fusion: FP8 block sizes differ for {name}: "
-                    f"{block_sizes}"
-                )
+                    f"{block_sizes}")
         elif is_nvfp4_linear(first_proj):
             if not _can_fuse_nvfp4_scales(attn):
                 logger.warning(
@@ -544,6 +538,7 @@ def fuse_qkv_projections(model: nn.Module) -> int:
                 out_features=fused_out_dim,
                 block_size=first_proj.block_size,
                 bias=has_bias,
+                backend=first_proj.backend,
             )
         else:
             fused_linear = FP16Linear(in_features,

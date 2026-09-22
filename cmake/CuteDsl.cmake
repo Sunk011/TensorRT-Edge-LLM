@@ -51,6 +51,7 @@
 #   CUTE_DSL_RMSNORM_ENABLED — set when the rmsnorm group is active
 #   CUTE_DSL_NVFP4_A16_BLACKWELL_GEMM_ENABLED — set when the SM110 dense W4A16
 #                                                GEMM group is active
+#   CUTE_DSL_FP8_BLOCK_GEMM_ENABLED — set when the FP8 blockwise GEMM group is active
 #   CUTE_DSL_GEMM_ENABLED  — set when any gemm variant is active
 # ---------------------------------------------------------------------------
 # cmake-format: on
@@ -59,7 +60,7 @@ set(ENABLE_CUTE_DSL
     "fmha"
     CACHE
       STRING
-      "CuTe DSL kernels: OFF, ALL, or semicolon-separated group list (fmha;gdn;rmsnorm)"
+      "CuTe DSL kernels: OFF, ALL, or semicolon-separated group list (fmha;gdn;fp8_block_gemm;rmsnorm)"
 )
 
 set(CUTE_DSL_ARTIFACT_TAG

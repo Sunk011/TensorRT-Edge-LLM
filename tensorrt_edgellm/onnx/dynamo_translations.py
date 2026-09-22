@@ -166,6 +166,7 @@ def _fp8_block_gemm_translation(
     weight_scale_inv: onnxscript.FLOAT,
     gemm_n: int,
     gemm_k: int,
+    backend: int = 0,
 ) -> onnxscript.FLOAT16:
     # hidden_states: [b, seq, K] fp16; weight: [N, K] int8 (fp8 bits);
     # weight_scale_inv: [N/128, K/128] fp32. Emits the block-wise FP8 GEMM
@@ -176,6 +177,7 @@ def _fp8_block_gemm_translation(
         weight_scale_inv,
         gemm_n=gemm_n,
         gemm_k=gemm_k,
+        backend=backend,
     )
 
 

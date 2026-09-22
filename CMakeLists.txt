@@ -232,6 +232,7 @@ target_link_options(commonLibraryExt INTERFACE
 #                       SM110-only ``Nvfp4MoePlugin``
 #   nvfp4_fused_moe  -- SM12x (consumer Blackwell / Spark GB10) fused NVFP4
 #                       MoE; consumed by ``NvFP4MoEPluginGeforce``
+#   fp8_block_gemm   -- FP8 E4M3 GEMM with FP32 1x128/128x128 block scales
 #   rmsnorm          -- FP16/BF16 RMSNorm for supported production hidden sizes
 #   semicolon-separated group list (e.g. -DENABLE_CUTE_DSL=fmha;gdn)
 # cmake-format: on
@@ -239,7 +240,7 @@ set(ENABLE_CUTE_DSL
     "fmha"
     CACHE
       STRING
-      "CuTe DSL kernels: fmha (default), ALL, or semicolon-separated group list (fmha;gdn;f16_moe;rmsnorm)"
+      "CuTe DSL kernels: fmha (default), ALL, or semicolon-separated group list (fmha;gdn;f16_moe;fp8_block_gemm;rmsnorm)"
 )
 
 # Build Core libraries of the project. attentionPlugin shared library and

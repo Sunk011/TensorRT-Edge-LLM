@@ -337,6 +337,7 @@ target_link_options(NvInfer_edgellm_plugin PRIVATE "-Wl,--exclude-libs,ALL")
 #                       SM110-only ``Nvfp4MoePlugin``
 #   nvfp4_fused_moe  -- SM12x (consumer Blackwell / Spark GB10) fused NVFP4
 #                       MoE; consumed by ``NvFP4MoEPluginGeforce``
+#   fp8_block_gemm   -- FP8 E4M3 GEMM with FP32 1x128/128x128 block scales
 #   rmsnorm          -- FP16/BF16 RMSNorm for supported production hidden sizes
 # or a semicolon-separated list (e.g. fmha;gdn), or ALL. fmha is always linked.
 # See the top-level CMakeLists.txt for the canonical option list.

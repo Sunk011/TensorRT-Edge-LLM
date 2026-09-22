@@ -529,6 +529,21 @@ def _(hidden_states, scale):
 # Block-wise FP8 GEMM group size (activation per-token groups and weight
 # blocks are both 128 along K for the Qwen3 / DeepSeek recipe).
 _FP8_BLOCK_GEMM_GROUP = 128
+FP8_BLOCK_GEMM_BACKENDS = {
+    "cutlass": 0,
+    "cute_dsl": 1,
+    "auto": 2,
+}
+
+
+def fp8_block_gemm_backend_id(backend: str) -> int:
+    """Return the serialized FP8 blockwise GEMM backend identifier."""
+    try:
+        return FP8_BLOCK_GEMM_BACKENDS[backend]
+    except KeyError as error:
+        raise ValueError(
+            f"Unknown FP8 block GEMM backend {backend!r}; "
+            f"choose one of {sorted(FP8_BLOCK_GEMM_BACKENDS)}") from error
 
 
 def _fp8_block_gemm_eager(
@@ -581,6 +596,7 @@ def fp8_block_gemm(
     weight_scale_inv: torch.Tensor,  # float32 [N/128, K/128]
     gemm_n: int,
     gemm_k: int,
+    backend: int = 0,
 ) -> torch.Tensor:
     """Block-wise FP8 GEMM; ONNX export -> trt_edgellm::FP8BlockGemmPlugin.
 
@@ -592,7 +608,8 @@ def fp8_block_gemm(
 
 
 @fp8_block_gemm.register_fake
-def _(hidden_states, weight, weight_scale_inv, gemm_n, gemm_k):
+def _(hidden_states, weight, weight_scale_inv, gemm_n, gemm_k, backend=0):
+    del backend
     return torch.empty((*hidden_states.shape[:-1], gemm_n),
                        dtype=torch.float16,
                        device=hidden_states.device)

@@ -1000,7 +1000,8 @@ def _export_llm(model_dir: str,
                 tp_size: int = 1,
                 num_decoder_layers: "int | None" = None,
                 skip_softmax_scale_factor: "float | None" = None,
-                quantization_override: "str | None" = None) -> None:
+                quantization_override: "str | None" = None,
+                fp8_block_gemm_backend: str = "cutlass") -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
@@ -1107,6 +1108,20 @@ def _export_llm(model_dir: str,
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
             logger.exception("[LLM] Failed to load checkpoint")
             raise SystemExit(1) from exc
+
+        if fp8_block_gemm_backend != "cutlass":
+            from ..models.linear import FP8BlockLinear
+            from ..models.ops import fp8_block_gemm_backend_id
+            backend_id = fp8_block_gemm_backend_id(fp8_block_gemm_backend)
+            count = 0
+            for module in model.modules():
+                if isinstance(module, FP8BlockLinear):
+                    module.backend = backend_id
+                    count += 1
+            if count:
+                logger.info(
+                    "[LLM] FP8 block GEMM backend=%s for %d projections",
+                    fp8_block_gemm_backend, count)
 
         # CLI override of the skip-softmax (BLASST) scale factor: None = flag not given (keep the config value); an explicit 0.0
         # disables skip-softmax even when config.json carries a positive S.
@@ -4065,6 +4080,16 @@ def main() -> None:
               "Int4GroupwiseGemmPlugin with AWQ-swizzled weights."),
     )
     p.add_argument(
+        "--fp8-block-gemm-backend",
+        choices=["cutlass", "cute_dsl", "auto"],
+        default="cutlass",
+        help=(
+            "FP8 blockwise GEMM backend emitted for Qwen3/DeepSeek FP8 block "
+            "checkpoints. cute_dsl uses the AOT CuTe DSL kernel when its "
+            "shape has M >= 128; auto uses it for M >= 128 and CUTLASS "
+            "otherwise."),
+    )
+    p.add_argument(
         "--quantization",
         default=None,
         choices=["int4_awq", "nvfp4"],
@@ -4448,31 +4473,31 @@ def main() -> None:
     # drive both the pre-run log and the post-run summary below.
     stages = [
         (_has_llm_component(model_type, "thinker") and not args.skip_llm
-         and not _draft_only
-         and _allow("thinker"), "thinker", lambda out: _export_llm(
-             model_dir,
-             out,
-             model_type=model_type,
-             eagle_base=args.eagle_base,
-             eagle_draft_dir=args.eagle_draft_dir,
-             mtp_base=args.mtp and not gemma4_mtp_requested,
-             mtp_tree_base=args.mtp_tree_base,
-             dflash_base=args.dflash_base,
-             dflash_tree_base=args.dflash_tree_base,
-             dflash_draft_dir=args.dflash_draft_dir,
-             jetspec_base=args.jetspec_base,
-             jetspec_tree_base=args.jetspec_tree_base,
-             jetspec_draft_dir=args.jetspec_draft_dir,
-             dspark_base=args.dspark_base,
-             dspark_draft_dir=args.dspark_draft_dir,
-             gemma4_mtp_base=gemma4_mtp_requested,
-             fp8_embedding=args.fp8_embedding,
-             reduced_vocab_dir=args.reduced_vocab_dir,
-             externalize_weights=externalize_weights,
-             tp_size=args.tp_size,
-             num_decoder_layers=args.num_decoder_layer,
-             skip_softmax_scale_factor=args.skip_softmax_scale_factor,
-             quantization_override=getattr(args, 'quantization', None))),
+         and not _draft_only and _allow("thinker"), "thinker", lambda out:
+         _export_llm(model_dir,
+                     out,
+                     model_type=model_type,
+                     eagle_base=args.eagle_base,
+                     eagle_draft_dir=args.eagle_draft_dir,
+                     mtp_base=args.mtp and not gemma4_mtp_requested,
+                     mtp_tree_base=args.mtp_tree_base,
+                     dflash_base=args.dflash_base,
+                     dflash_tree_base=args.dflash_tree_base,
+                     dflash_draft_dir=args.dflash_draft_dir,
+                     jetspec_base=args.jetspec_base,
+                     jetspec_tree_base=args.jetspec_tree_base,
+                     jetspec_draft_dir=args.jetspec_draft_dir,
+                     dspark_base=args.dspark_base,
+                     dspark_draft_dir=args.dspark_draft_dir,
+                     gemma4_mtp_base=gemma4_mtp_requested,
+                     fp8_embedding=args.fp8_embedding,
+                     reduced_vocab_dir=args.reduced_vocab_dir,
+                     externalize_weights=externalize_weights,
+                     tp_size=args.tp_size,
+                     num_decoder_layers=args.num_decoder_layer,
+                     skip_softmax_scale_factor=args.skip_softmax_scale_factor,
+                     quantization_override=getattr(args, 'quantization', None),
+                     fp8_block_gemm_backend=args.fp8_block_gemm_backend)),
         (args.mtp and not gemma4_mtp_requested
          and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
              model_dir, out, externalize_weights=externalize_weights)),

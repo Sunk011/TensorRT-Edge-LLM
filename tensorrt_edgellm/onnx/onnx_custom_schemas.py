@@ -802,6 +802,12 @@ _fp8_block_gemm_schema = OpSchema(
             description="Input feature dimension (K)",
             required=True,
         ),
+        OpSchema.Attribute(
+            name="backend",
+            type=OpSchema.AttrType.INT,
+            description="FP8 block GEMM backend selector",
+            required=True,
+        ),
     ],
 )
 

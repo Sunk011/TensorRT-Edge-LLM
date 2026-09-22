@@ -38,11 +38,12 @@ from ..config import (QUANT_FP8, QUANT_FP8_BLOCK, QUANT_FP16, QUANT_INT4_AWQ,
                       QUANT_INT4_AWQ_MODELOPT, QUANT_INT4_GPTQ, QUANT_INT8_SQ,
                       QUANT_MXFP8, QUANT_NVFP4, QUANT_NVFP4_A16, Mapping,
                       ModelConfig, module_quant_type)
-from .ops import (fp8_block_gemm, fp8_dequantize, fp8_quantize,
-                  fused_nvfp4_gemm_allreduce, int4_gemm_plugin_version,
-                  int4_groupwise_gemm, int4_groupwise_gemm_v2, int8_sq_act_qdq,
-                  int8_sq_weight_dq, mxfp8_act_qdq, mxfp8_weight_dq,
-                  nvfp4_a16_gemm, nvfp4_act_qdq, nvfp4_dequantize)
+from .ops import (fp8_block_gemm, fp8_block_gemm_backend_id, fp8_dequantize,
+                  fp8_quantize, fused_nvfp4_gemm_allreduce,
+                  int4_gemm_plugin_version, int4_groupwise_gemm,
+                  int4_groupwise_gemm_v2, int8_sq_act_qdq, int8_sq_weight_dq,
+                  mxfp8_act_qdq, mxfp8_weight_dq, nvfp4_a16_gemm,
+                  nvfp4_act_qdq, nvfp4_dequantize)
 
 logger = logging.getLogger(__name__)
 
@@ -259,11 +260,15 @@ class FP8BlockLinear(LinearBase):
             out_features: int,
             block_size=(128, 128),
             bias: bool = False,
+            backend: int = 0,
     ) -> None:
         super().__init__()
 
         self.in_features = in_features
         self.out_features = out_features
+        if backend not in (0, 1, 2):
+            raise ValueError(f"Invalid FP8 block GEMM backend: {backend}")
+        self.backend = backend
 
         self.block_size = (
             int(block_size[0]),
@@ -328,6 +333,7 @@ class FP8BlockLinear(LinearBase):
             self.weight_scale_inv,
             self.out_features,
             self.in_features,
+            self.backend,
         )
         if self.bias is not None:
             out = out + self.bias.to(torch.float16)
@@ -978,6 +984,8 @@ def make_linear(
             out_features,
             block_size=config.quant.block_size,
             bias=bias,
+            backend=fp8_block_gemm_backend_id(
+                config.quant.fp8_block_gemm_backend),
         )
     elif quant_type == QUANT_MXFP8:
         layer = MXFP8Linear(in_features, out_features, config.quant.group_size,

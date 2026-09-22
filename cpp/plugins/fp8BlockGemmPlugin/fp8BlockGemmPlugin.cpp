@@ -18,6 +18,7 @@
 #include "fp8BlockGemmPlugin.h"
 
 #include "common/logger.h"
+#include "kernels/fp8BlockwiseGemm/cuteDslFp8BlockwiseGemmRunner.h"
 #include "kernels/fp8BlockwiseGemm/fp8BlockwiseGemmRunner.h"
 #include "kernels/fp8BlockwiseGemm/fp8BlockwiseScaleTranspose.h"
 #include "kernels/fp8BlockwiseGemm/fp8PerTokenGroupQuantize.h"
@@ -28,6 +29,7 @@
 #include <cstdint>
 #include <exception>
 #include <mutex>
+#include <stdexcept>
 
 using namespace nvinfer1;
 
@@ -41,6 +43,9 @@ namespace
 constexpr char const* kPLUGIN_NAME{"FP8BlockGemmPlugin"};
 constexpr char const* kPLUGIN_VERSION{"1"};
 constexpr int32_t kBLOCK_SIZE{128};
+constexpr int32_t kBackendCutlass{0};
+constexpr int32_t kBackendCuteDsl{1};
+constexpr int32_t kBackendAuto{2};
 
 // 256-byte alignment keeps the FP8 activation buffer, the FP32 SFA buffer and
 // the CUTLASS workspace independently aligned inside one TRT workspace blob.
@@ -49,6 +54,11 @@ inline size_t alignUp(size_t x, size_t a)
 {
     return (x + a - 1) & ~(a - 1);
 }
+
+bool isValidBackend(int32_t backend)
+{
+    return backend == kBackendCutlass || backend == kBackendCuteDsl || backend == kBackendAuto;
+}
 } // namespace
 
 PluginFieldCollection FP8BlockGemmPluginCreator::mFieldCollection{};
@@ -56,10 +66,11 @@ std::vector<PluginField> FP8BlockGemmPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(FP8BlockGemmPluginCreator);
 
-FP8BlockGemmPlugin::FP8BlockGemmPlugin(std::string const& name, int32_t N, int32_t K)
+FP8BlockGemmPlugin::FP8BlockGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t backend)
     : mLayerName(name)
     , mGemmN(N)
     , mGemmK(K)
+    , mBackend(backend)
 {
 }
 
@@ -77,6 +88,14 @@ FP8BlockGemmPlugin::FP8BlockGemmPlugin(std::string const& name, PluginFieldColle
         {
             mGemmK = *static_cast<int32_t const*>(fc->fields[i].data);
         }
+        else if (fieldName == "backend")
+        {
+            mBackend = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
+    }
+    if (!isValidBackend(mBackend))
+    {
+        throw std::invalid_argument("FP8BlockGemmPlugin: invalid backend");
     }
 }
 
@@ -105,7 +124,7 @@ IPluginV3* FP8BlockGemmPlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new FP8BlockGemmPlugin(mLayerName, mGemmN, mGemmK);
+        auto* plugin = new FP8BlockGemmPlugin(mLayerName, mGemmN, mGemmK, mBackend);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -265,11 +284,6 @@ int32_t FP8BlockGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTen
 {
     try
     {
-        if (!kernel::fp8BlockwiseGemmSupported())
-        {
-            LOG_ERROR("FP8BlockGemmPlugin: block-wise FP8 GEMM unsupported on this device (needs SM100/SM110).");
-            return -1;
-        }
         int64_t const m64 = static_cast<int64_t>(inputDesc[0].dims.d[0]) * inputDesc[0].dims.d[1];
         if (m64 <= 0)
         {
@@ -288,6 +302,27 @@ int32_t FP8BlockGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTen
 
         // 1) Dynamic per-token, per-128-K-group activation quantization (fp16 -> fp8 + SFA).
         kernel::launchFp8PerTokenGroupQuantize(inputs[0], aFp8, sfa, M, K, stream);
+
+        bool const cuteDslCanImplement = kernel::fp8BlockwiseCuteDslGemmCanImplement(M, N, K);
+        bool const useCuteDsl = (mBackend == kBackendCuteDsl && cuteDslCanImplement)
+            || (mBackend == kBackendAuto && cuteDslCanImplement && M >= kBLOCK_SIZE);
+        if (useCuteDsl)
+        {
+            cudaError_t const error = kernel::launchFp8BlockwiseCuteDslGemm(
+                aFp8, sfa, inputs[1], static_cast<float const*>(inputs[2]), outputs[0], M, N, K, stream);
+            if (error != cudaSuccess)
+            {
+                LOG_ERROR("FP8BlockGemmPlugin: CuTe DSL FP8 blockwise GEMM failed: %s", cudaGetErrorString(error));
+                return -1;
+            }
+            return 0;
+        }
+
+        if (!kernel::fp8BlockwiseGemmSupported())
+        {
+            LOG_ERROR("FP8BlockGemmPlugin: no FP8 blockwise backend supports M=%d, N=%d, K=%d.", M, N, K);
+            return -1;
+        }
 
         if (kernel::fp8BlockwiseGemm2CtaSupported(M, N, K))
         {
@@ -336,6 +371,7 @@ PluginFieldCollection const* FP8BlockGemmPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.clear();
     mDataToSerialize.emplace_back("gemm_n", &mGemmN, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("gemm_k", &mGemmK, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("backend", &mBackend, PluginFieldType::kINT32, 1);
     mFCToSerialize.nbFields = static_cast<int32_t>(mDataToSerialize.size());
     mFCToSerialize.fields = mDataToSerialize.data();
     return &mFCToSerialize;
@@ -349,6 +385,7 @@ FP8BlockGemmPluginCreator::FP8BlockGemmPluginCreator()
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(PluginField("gemm_n", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("gemm_k", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("backend", nullptr, PluginFieldType::kINT32, 1));
 
     mFieldCollection.nbFields = static_cast<int32_t>(mPluginAttributes.size());
     mFieldCollection.fields = mPluginAttributes.data();
